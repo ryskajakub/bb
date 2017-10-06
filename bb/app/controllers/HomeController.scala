@@ -148,7 +148,11 @@ class HomeController @Inject()(cc: ControllerComponents) extends AbstractControl
   /* number of messages in one batch */
   val readBatchSize = 10
 
-  /* will create as many futures as is in readBatchSize constant. Everytime all data from one batch is read, it is flushed downstream */
+  // will create as many futures as is in readBatchSize constant. 
+  // Everytime all data from one batch is read, it is flushed downstream
+  //
+  // Because the aws queue is filled by some application, i needed to
+  // restrict the number of messeges that it will read.
   def readMessages() = Action {
 
     def jsonifyMessages(countdown: Int)
