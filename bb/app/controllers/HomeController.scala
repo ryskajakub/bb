@@ -41,9 +41,11 @@ import com.amazonaws.services.sqs.model._
 @Singleton
 class HomeController @Inject()(cc: ControllerComponents) extends AbstractController(cc) {
 
+  /* separate execution context so other requests can be server during calling aws services */
   val awsEc = ExecutionContext.fromExecutor(
     new ForkJoinPool())
 
+  /* connect to the aws sqs */
   lazy val (sqs, queueUrl) = {
     val queueName = "test"
     val awsSecret = sys.env("SECRET")
@@ -86,31 +88,12 @@ class HomeController @Inject()(cc: ControllerComponents) extends AbstractControl
       Json.stringify(messageBody));
   }
 
+  /* number of messages in batch */
   val writeBatchSize = 10   
+  /* count of batches sent to server */
   val writeBatchesCount = 1000 
 
-  def pushMessages() = Action.async {
-
-    val allRequests = (0 until writeBatchesCount).map(_ => {
-      val p = Promise[Unit]()
-      val entries = (0 until writeBatchSize).map(_ => mkMessage)
-      val request = new SendMessageBatchRequest().withQueueUrl(queueUrl).withEntries(JavaConverters.asJavaCollection(entries))
-      val handler = new AsyncHandler[SendMessageBatchRequest,
-          SendMessageBatchResult] {
-        def onError(e: Exception) = p.failure(e)
-        def onSuccess(req: SendMessageBatchRequest, 
-            res: SendMessageBatchResult) = 
-          p.success(())
-      }
-      sqs.sendMessageBatchAsync(request, handler)
-      p.future
-    })
-
-    implicit val c = awsEc
-    Future.sequence(allRequests).map(_ => Ok("ok"))
-
-  }
-
+  /* helper for creating aws async handler */
   def mkHandler[Req <: com.amazonaws.AmazonWebServiceRequest,Res](): 
       (Future[Res], AsyncHandler[Req, Res]) = {
     val p = Promise[Res]()
@@ -122,6 +105,24 @@ class HomeController @Inject()(cc: ControllerComponents) extends AbstractControl
         }
       }
     (p.future, handler)
+  }
+
+  /* creates as many futures as there is batch count and as all of them are done, will return ok */
+  def pushMessages() = Action.async {
+
+    val allRequests = (0 until writeBatchesCount).map(_ => {
+      val p = Promise[Unit]()
+      val entries = (0 until writeBatchSize).map(_ => mkMessage)
+      val request = new SendMessageBatchRequest().withQueueUrl(queueUrl).withEntries(JavaConverters.asJavaCollection(entries))
+      val (f, handler) = mkHandler[SendMessageBatchRequest,
+          SendMessageBatchResult] ()
+      sqs.sendMessageBatchAsync(request, handler)
+      f
+    })
+
+    implicit val c = awsEc
+    Future.sequence(allRequests).map(_ => Ok("ok"))
+
   }
 
   def status() = Action.async {
@@ -140,12 +141,17 @@ class HomeController @Inject()(cc: ControllerComponents) extends AbstractControl
     }(awsEc)
   }
 
-  val runs = 20
-  val readBatchSize = 5000
+  /* number of batches for reading */
+  val runs = 10
+  /* number of futures created during one batch */
+  val readBatchesSize = 100
+  /* number of messages in one batch */
+  val readBatchSize = 10
 
+  /* will create as many futures as is in readBatchSize constant. Everytime all data from one batch is read, it is flushed downstream */
   def readMessages() = Action {
 
-    def readMessage(countdown: Int)
+    def jsonifyMessages(countdown: Int)
         (messages: Seq[Message]): 
         Option[(Int,String)] = {
       countdown match {
@@ -174,8 +180,8 @@ class HomeController @Inject()(cc: ControllerComponents) extends AbstractControl
     def receiveMessage(countdown: Int): 
         Future[Option[(Int, String)]] = {
       val request = new ReceiveMessageRequest(queueUrl)
-        .withMaxNumberOfMessages(10)
-      val sentRequests: Seq[Future[ReceiveMessageResult]] = ((0 until readBatchSize).map { _ =>
+        .withMaxNumberOfMessages(readBatchSize)
+      val sentRequests: Seq[Future[ReceiveMessageResult]] = ((0 until readBatchesSize).map { _ =>
         val (f, handler) = 
           mkHandler[ReceiveMessageRequest, ReceiveMessageResult] ()
         sqs.receiveMessageAsync(request, handler)
@@ -185,7 +191,7 @@ class HomeController @Inject()(cc: ControllerComponents) extends AbstractControl
       val batchedSentRequests:Future[Seq[Message]] = 
         Future.sequence(sentRequests).map(_.flatMap(x =>
           JavaConverters.asScalaBuffer(x.getMessages())))
-      batchedSentRequests.map(readMessage(countdown))(awsEc)
+      batchedSentRequests.map(jsonifyMessages(countdown))(awsEc)
     }
 
     val source = Source.unfoldAsync(runs)(x => receiveMessage(x))
